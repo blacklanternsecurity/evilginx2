@@ -52,6 +52,7 @@ func main() {
 		if _, err := os.Stat(*resource_file); os.IsNotExist(err) {
 			log.Fatal("provided resource file does not exist: %s", *resource_file)
 			return
+		}
 	}
 	log.DebugEnable(*debug_log)
 	if *debug_log {
