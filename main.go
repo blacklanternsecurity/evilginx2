@@ -48,11 +48,9 @@ func main() {
 		log.Fatal("provided phishlets directory path does not exist: %s", *phishlets_dir)
 		return
 	}
-	if len(*resource_file) > 0 {
-		if _, err := os.Stat(*resource_file); os.IsNotExist(err) {
-			log.Fatal("provided resource file does not exist: %s", *resource_file)
-			return
-		}
+	if _, err := os.Stat(*resource_file); (len(*resource_file) > 0) && (os.IsNotExist(err)) {
+		log.Fatal("provided resource file does not exist: %s", *resource_file)
+		return
 	}
 	log.DebugEnable(*debug_log)
 	if *debug_log {
